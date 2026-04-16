@@ -1,0 +1,22 @@
+{
+  "timestamp": "2026-04-16T14-32",
+  "tag": "baseline_sweep",
+  "policies": [
+    "lru",
+    "slru",
+    "wlfu"
+  ],
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "mem_fraction": 0.85,
+  "bench_params": {
+    "num_prompts": 2048,
+    "gsp_num_groups": 128,
+    "gsp_prompts_per_group": 16,
+    "gsp_system_prompt_len": 1024,
+    "gsp_question_len": 64,
+    "gsp_output_len": 64,
+    "request_rate": 16
+  },
+  "cache_capacity_tokens": 352642,
+  "sglang_git_sha": "74b4f890780b870fda19b370e30038a495fbf9b2"
+}
