@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Tuple, Union
 
@@ -63,3 +64,21 @@ class SLRUStrategy(EvictionStrategy):
 
         is_protected = 1 if node.hit_count >= self.protected_threshold else 0
         return (is_protected, node.last_access_time)
+
+
+class WLFUStrategy(EvictionStrategy):
+    """Weighted LFU-LRU hybrid: frequency gives nodes a virtual recency bonus.
+
+    priority = last_access_time - alpha * log(1 + hit_count)
+
+    Nodes with higher hit_count appear "more recent" and resist eviction.
+    Under concurrent workloads with shared prefixes (system prompts, few-shot),
+    these nodes accumulate hits and survive bursts of unique requests that
+    would flush them under pure LRU.
+    """
+
+    def __init__(self, alpha: float = 2.0):
+        self.alpha = alpha
+
+    def get_priority(self, node: "TreeNode") -> float:
+        return node.last_access_time - self.alpha * math.log1p(node.hit_count)
