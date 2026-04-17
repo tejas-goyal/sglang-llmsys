@@ -7,6 +7,8 @@
 - Bench params: `{"num_prompts": 2048, "gsp_num_groups": 128, "gsp_prompts_per_group": 16, "gsp_system_prompt_len": 1024, "gsp_question_len": 64, "gsp_output_len": 64, "request_rate": 16}`
 - Baseline (for deltas): **lru**
 
+![TTFT and E2E comparison across policies](./ttft_comparison.png)
+
 | Metric | lru | wlfu | wslru | Δ vs lru | Δ vs lru |
 |---|---|---|---|---|---|
 | Output throughput (tok/s) | 991.42 | 982.89 | 987.55 | -0.9% | -0.4% |
