@@ -17,3 +17,17 @@
 | P99 E2E latency (ms) | 12731.56 | 9513.12 | 8956.07 | -25.3% | -29.7% |
 | Cache hit rate (final) | 0.000 | 0.000 | 0.000 | — | — |
 | Eviction count | 579 | 550 | 573 | -5.0% | -1.0% |
+
+## What the metrics mean
+
+Lower is better for all latency metrics; higher is better for throughput.
+
+- **Output throughput (tok/s)** — generated tokens per second across the run. Higher is better.
+- **Request throughput (req/s)** — completed requests per second. Higher is better.
+- **Mean TTFT (ms)** — average Time-To-First-Token: latency from request arrival to the first generated token. Dominated by prefill cost, so a better eviction policy (more prefix-cache hits) directly shrinks this. Lower is better.
+- **P99 TTFT (ms)** — 99th-percentile TTFT; the tail user experience. Lower is better.
+- **Mean / P99 E2E latency (ms)** — full request latency, prefill + decode. Lower is better.
+- **Cache hit rate (final)** — sampled at server shutdown when traffic is idle, so it reads 0.000 here; real hits are visible as `#cached-token` in prefill logs during the run.
+- **Eviction count** — number of radix-cache eviction operations during the run. Not better or worse on its own; useful as a sanity check that the cache was under pressure (0 would mean the eviction policy never fired and numbers are noise).
+
+Δ columns are the percentage change vs the baseline policy (`lru`). Negative Δ on a latency metric = improvement.
