@@ -153,6 +153,12 @@ def run_policies(policies: list[str]) -> dict:
             print(f"[server] Ready. Cache capacity: {capacity:,} tokens", flush=True)
 
             output_file = f"/tmp/results_{policy}.json"
+            # Warmup + flush removes position-in-list bias across policies:
+            # a burst of warmup requests forces JIT compilation of every prefill /
+            # attention / sampling kernel shape the main run will hit, then
+            # --flush-cache clears the radix tree so measurement starts from an
+            # empty cache for every policy (same state as a cold server) while
+            # disk-level Triton/inductor caches stay warm.
             bench_cmd = [
                 "python", "-m", "sglang.bench_serving",
                 "--backend", "sglang",
@@ -166,6 +172,8 @@ def run_policies(policies: list[str]) -> dict:
                 "--gsp-system-prompt-len", str(BENCH_PARAMS["gsp_system_prompt_len"]),
                 "--gsp-question-len", str(BENCH_PARAMS["gsp_question_len"]),
                 "--gsp-output-len", str(BENCH_PARAMS["gsp_output_len"]),
+                "--warmup-requests", str(BENCH_PARAMS["gsp_num_groups"]),
+                "--flush-cache",
                 "--output-file", output_file,
                 "--seed", "42",
             ]
