@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import os
 import subprocess
 import sys
 import time
@@ -35,7 +36,30 @@ LOCAL_EVICT_POLICY = (
 RESULTS_DIR = EVAL_DIR / "results"
 
 SGLANG_SRT = "/sgl-workspace/sglang/python/sglang/srt"
+SGLANG_BENCH_SERVING = "/sgl-workspace/sglang/python/sglang/bench_serving.py"
 MINUTES = 60
+
+# --------------------------------------------------------------------------- #
+# Pluggable human-readable corpus sources.                                    #
+# `generated-shared-prefix` draws random tokens from the vocab by default;    #
+# setting --dataset <name> flips SGLANG_EVAL_GEN_PROMPT_SOURCE=human inside   #
+# the bench subprocess and points SGLANG_EVAL_HUMAN_CORPUS at a pre-baked     #
+# text file on the huggingface-cache Modal volume. One dict entry per HF      #
+# source; files are cached to <HF_CACHE_PATH>/eval/<name>.txt so A/B between  #
+# sources on the same volume never reuses a stale corpus.                    #
+# --------------------------------------------------------------------------- #
+HUMAN_CORPUS_SOURCES: dict[str, dict] = {
+    "wikitext": {
+        "path": "wikitext",
+        "name": "wikitext-103-raw-v1",
+        "split": "train[:20000]",
+        "text_field": "text",
+    },
+    # Add more sources here; one dict entry per new HF dataset. Example:
+    # "c4":          {"path": "allenai/c4",             "name": "en",   "split": "train[:20000]", "text_field": "text"},
+    # "openwebtext": {"path": "Skylion007/openwebtext", "name": None,   "split": "train[:20000]", "text_field": "text"},
+}
+HUMAN_ALIASES = {"human": "wikitext"}  # readable CLI aliases
 
 # --------------------------------------------------------------------------- #
 # Image: overlay our evict_policy.py, then run the registry-aware patcher.    #
@@ -58,6 +82,16 @@ sglang_image = (
     .add_local_file(str(EVAL_DIR / "registry.py"), remote_path="/tmp/eval/registry.py", copy=True)
     .add_local_file(str(EVAL_DIR / "patcher.py"), remote_path="/tmp/eval/patcher.py", copy=True)
     .run_commands(f"python3 /tmp/eval/patcher.py {SGLANG_SRT}")
+    # Human-readable prompt source: install `datasets` + patch gen_prompt in
+    # v0.5.9's monolithic bench_serving.py. Corpus files are downloaded lazily
+    # at runtime into the huggingface-cache volume; nothing gets baked in.
+    .pip_install("datasets")
+    .add_local_file(
+        str(EVAL_DIR / "human_dataset_patcher.py"),
+        remote_path="/tmp/eval/human_dataset_patcher.py",
+        copy=True,
+    )
+    .run_commands(f"python3 /tmp/eval/human_dataset_patcher.py {SGLANG_BENCH_SERVING}")
 )
 
 # --------------------------------------------------------------------------- #
@@ -67,6 +101,11 @@ MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 MODEL_REVISION: str | None = None
 PORT = 8000
 MEM_FRACTION = 0.85
+# Read at module-import time so `@app.function(gpu=...)` below is bound before
+# Modal serializes the function. Bash callers (see sweep.sh) set EVAL_GPU per
+# `modal run` invocation to target H100 / H200 / B200 without editing source.
+# Default preserves historical A100-40GB behaviour for every example in README.
+DEFAULT_GPU = os.environ.get("EVAL_GPU", "A100-40GB")
 
 BENCH_PARAMS = {
     "num_prompts": 2048,
@@ -80,6 +119,23 @@ BENCH_PARAMS = {
 
 HF_CACHE_VOL = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 HF_CACHE_PATH = "/root/.cache/huggingface"
+HUMAN_CORPUS_DIR = f"{HF_CACHE_PATH}/eval"
+
+
+def _corpus_path(name: str) -> str:
+    return f"{HUMAN_CORPUS_DIR}/{name}.txt"
+
+
+def _resolve_dataset(dataset: str) -> str:
+    """Canonicalize CLI dataset name. 'synthetic' -> 'synthetic'; aliases -> registry key."""
+    if dataset == "synthetic":
+        return dataset
+    name = HUMAN_ALIASES.get(dataset, dataset)
+    if name not in HUMAN_CORPUS_SOURCES:
+        valid = sorted({"synthetic", *HUMAN_ALIASES, *HUMAN_CORPUS_SOURCES})
+        raise ValueError(f"--dataset must be one of {valid}, got {dataset!r}")
+    return name
+
 
 app = modal.App("eviction-eval")
 
@@ -112,18 +168,78 @@ def _metric(pattern: str, cast=float, default=0.0):
     return default
 
 
+def _ensure_corpus(name: str) -> str:
+    """Lazily download the selected HF text source onto the huggingface-cache volume.
+
+    First call per volume downloads and commits; subsequent calls are no-ops
+    that just return the path. Each source caches to its own `<name>.txt` so
+    switching --dataset between sources never reuses stale text.
+    """
+    import pathlib
+
+    spec = HUMAN_CORPUS_SOURCES[name]
+    p = pathlib.Path(_corpus_path(name))
+    if p.exists() and p.stat().st_size > 0:
+        print(
+            f"[dataset] Reusing cached {name} corpus at {p} "
+            f"({p.stat().st_size // 1024} KB)",
+            flush=True,
+        )
+        return str(p)
+
+    print(
+        f"[dataset] Downloading {name} ({spec['path']}"
+        + (f"/{spec['name']}" if spec.get("name") else "")
+        + f", split={spec['split']}) to {p}...",
+        flush=True,
+    )
+    from datasets import load_dataset
+
+    ds = load_dataset(
+        spec["path"],
+        spec.get("name"),
+        split=spec["split"],
+        cache_dir=f"{HF_CACHE_PATH}/datasets",
+    )
+    field = spec["text_field"]
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("".join(r.get(field, "") or "" for r in ds))
+    HF_CACHE_VOL.commit()
+    print(
+        f"[dataset] Wrote {p.stat().st_size // 1024} KB to {p} and committed volume.",
+        flush=True,
+    )
+    return str(p)
+
+
 # --------------------------------------------------------------------------- #
 # Container entrypoint                                                        #
 # --------------------------------------------------------------------------- #
 @app.function(
     image=sglang_image,
-    gpu="A100",
+    gpu=DEFAULT_GPU,
     volumes={HF_CACHE_PATH: HF_CACHE_VOL},
     timeout=90 * MINUTES,
 )
-def run_policies(policies: list[str]) -> dict:
+def run_policies(
+    policies: list[str],
+    dataset: str = "synthetic",
+    model: str = MODEL_NAME,
+    mem_fraction: float = MEM_FRACTION,
+) -> dict:
     """Run each policy end-to-end in this container. Return {policy: results_dict}."""
     import requests as req  # noqa: F401  (keeps imports adjacent to remote context)
+
+    resolved = _resolve_dataset(dataset)
+    bench_env: dict[str, str] | None = None
+    if resolved != "synthetic":
+        corpus = _ensure_corpus(resolved)
+        bench_env = {
+            **os.environ,
+            "SGLANG_EVAL_GEN_PROMPT_SOURCE": "human",
+            "SGLANG_EVAL_HUMAN_CORPUS": corpus,
+        }
+        print(f"[dataset] Active human corpus: {resolved} -> {corpus}", flush=True)
 
     out: dict[str, dict] = {}
     capacity_tokens: int | None = None
@@ -134,13 +250,13 @@ def run_policies(policies: list[str]) -> dict:
         revision_args = ["--revision", MODEL_REVISION] if MODEL_REVISION else []
         cmd = [
             "python", "-m", "sglang.launch_server",
-            "--model-path", MODEL_NAME,
+            "--model-path", model,
             *revision_args,
-            "--served-model-name", MODEL_NAME,
+            "--served-model-name", model,
             "--host", "0.0.0.0",
             "--port", str(PORT),
             "--tp", "1",
-            "--mem-fraction", str(MEM_FRACTION),
+            "--mem-fraction", str(mem_fraction),
             "--radix-eviction-policy", policy,
             "--enable-metrics",
             "--decode-log-interval", "50",
@@ -163,7 +279,7 @@ def run_policies(policies: list[str]) -> dict:
                 "python", "-m", "sglang.bench_serving",
                 "--backend", "sglang",
                 "--base-url", f"http://127.0.0.1:{PORT}",
-                "--model", MODEL_NAME,
+                "--model", model,
                 "--dataset-name", "generated-shared-prefix",
                 "--num-prompts", str(BENCH_PARAMS["num_prompts"]),
                 "--request-rate", str(BENCH_PARAMS["request_rate"]),
@@ -177,7 +293,7 @@ def run_policies(policies: list[str]) -> dict:
                 "--output-file", output_file,
                 "--seed", "42",
             ]
-            subprocess.run(bench_cmd, check=True, stderr=subprocess.STDOUT)
+            subprocess.run(bench_cmd, check=True, stderr=subprocess.STDOUT, env=bench_env)
             time.sleep(10)
 
             evictions = int(_metric("eviction_duration_seconds_count", default=0))
@@ -215,27 +331,50 @@ def _git_sha() -> str:
 
 
 @app.local_entrypoint()
-def main(policies: str = "lru,slru,wlfu", tag: str = "sweep") -> None:
+def main(
+    policies: str = "lru,slru,wlfu",
+    tag: str = "sweep",
+    dataset: str = "synthetic",
+    model: str = MODEL_NAME,
+    gpu: str = DEFAULT_GPU,
+    mem_fraction: float = MEM_FRACTION,
+) -> None:
     names = [p.strip() for p in policies.split(",") if p.strip()]
     if not names:
         raise SystemExit("--policies must be a non-empty CSV (e.g. 'lru,wlfu')")
+    resolved_dataset = _resolve_dataset(dataset)
 
     ts = _dt.datetime.now().strftime("%Y-%m-%dT%H-%M")
     run_dir = RESULTS_DIR / f"{ts}_{tag}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[runner] Policies: {names}")
+    print(f"[runner] Dataset:  {dataset} (resolved: {resolved_dataset})")
+    print(f"[runner] Model:    {model}")
+    print(f"[runner] GPU:      {gpu}  mem_fraction={mem_fraction}")
     print(f"[runner] Results dir: {run_dir}")
 
-    all_results = run_policies.remote(names)
+    # `gpu` arg is logged in config.json for traceability. The ACTUAL GPU
+    # binding was resolved at module import from EVAL_GPU; warn loudly on
+    # mismatch so a CLI user never thinks they got a different GPU than they
+    # actually did.
+    if gpu != DEFAULT_GPU:
+        raise SystemExit(
+            f"--gpu={gpu!r} does not match EVAL_GPU env ({DEFAULT_GPU!r}). "
+            f"To bind a different GPU, prepend `EVAL_GPU={gpu}` to the modal "
+            f"run invocation."
+        )
+    all_results = run_policies.remote(names, resolved_dataset, model, mem_fraction)
     capacity = all_results.pop("_capacity_tokens", None)
 
     config = {
         "timestamp": ts,
         "tag": tag,
         "policies": names,
-        "model": MODEL_NAME,
-        "mem_fraction": MEM_FRACTION,
+        "dataset": resolved_dataset,
+        "model": model,
+        "gpu": gpu,
+        "mem_fraction": mem_fraction,
         "bench_params": BENCH_PARAMS,
         "cache_capacity_tokens": capacity,
         "sglang_git_sha": _git_sha(),
