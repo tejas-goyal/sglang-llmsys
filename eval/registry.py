@@ -22,6 +22,18 @@ POLICY_REGISTRY = {
         "class_name": "WLFUStrategy",
         "description": "Weighted LFU-LRU: priority = last_access - alpha*log1p(hit_count).",
     },
+    "wslru": {
+        "class_name": "WSLRUStrategy",
+        "description": "Hybrid SLRU×WLFU: segment gate (hit>=2) with WLFU ordering within segment.",
+    },
+    "calru": {
+        "class_name": "CALRUStrategy",
+        "description": "Cost-Aware LRU: priority = last_access + alpha*log1p(hit_count*len(node)).",
+    },
+    "scalru": {
+        "class_name": "SCALRUStrategy",
+        "description": "Size-gated CALRU: protect iff hit_count*len >= cost_threshold, CALRU tiebreak.",
+    },
 }
 
 STOCK_POLICIES = {"lru", "lfu", "fifo", "mru", "filo", "priority"}

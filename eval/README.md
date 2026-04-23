@@ -35,6 +35,41 @@ modal run sglang/eval/runner.py --policies wlfu --tag wlfu_only
 Results land in `sglang/eval/results/<timestamp>_<tag>/`. The first policy in
 the CSV is the baseline for delta columns in `summary.md`.
 
+## Choose a prompt source
+
+By default the bench uses v0.5.9's synthetic `generated-shared-prefix` (random
+tokens sampled from the tokenizer vocab). Pass `--dataset <name>` to swap in
+real human-readable text while keeping the same workload shape (128 groups x
+16 prompts x 1024-token prefix x 64-token output):
+
+```bash
+# Real English prompts from wikitext-103
+modal run sglang/eval/runner.py --policies lru,wlfu,wslru --dataset wikitext --tag wikitext_triple
+
+# `human` is an alias for `wikitext`
+modal run sglang/eval/runner.py --policies lru --dataset human --tag smoke_human
+```
+
+First run per `huggingface-cache` volume downloads and commits the corpus
+(~30s, one-time). Every subsequent run on that volume reuses the cached file.
+Each source caches to its own `<name>.txt` on the volume, so switching
+between sources never reuses stale text.
+
+To add another HF text dataset, drop one entry in `HUMAN_CORPUS_SOURCES` in
+[runner.py](runner.py) and pass its key as `--dataset <name>`:
+
+```python
+HUMAN_CORPUS_SOURCES = {
+    "wikitext": {"path": "wikitext", "name": "wikitext-103-raw-v1",
+                 "split": "train[:20000]", "text_field": "text"},
+    "c4":       {"path": "allenai/c4", "name": "en",
+                 "split": "train[:20000]", "text_field": "text"},
+}
+```
+
+`config.json` records the resolved dataset name for each run so summaries
+stay traceable to the prompt source.
+
 ## Add a new policy
 
 1. Add a subclass of `EvictionStrategy` in
